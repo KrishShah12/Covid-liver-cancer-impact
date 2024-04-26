@@ -1,0 +1,675 @@
+---
+title: "Covid-Liver"
+author: "Krish Shah"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#Load libraries
+```{r}
+library(survival)
+library(naniar)
+library(visdat)
+library(ggplot2)
+library(mice)
+library(missForest)
+library(readr)
+library(VIM)
+library(dplyr)
+library(corrplot)
+library(survminer)
+library(pROC)
+library(caret)
+library(glmnet)
+```
+
+
+```{r}
+df <- read.csv('covid-liver.csv')
+head(df)
+```
+
+
+```{r}
+dim(df)
+summary(df)
+```
+
+
+```{r}
+character_columns <- sapply(df, is.character)
+
+# Extract names of character columns
+character_column_names <- names(character_columns)[character_columns]
+print(character_column_names)
+```
+
+
+```{r}
+# Convert character columns to factors
+df[character_column_names] <- lapply(df[character_column_names], as.factor)
+head(df)
+```
+
+#Little's MCAR Test
+```{r}
+mcar_test(df)
+```
+
+#Missing Data Visualisation
+
+
+
+```{r}
+vis_miss(df) +
+  theme(axis.text.x =  element_text(angle = 90))
+```
+
+
+```{r}
+library(VIM)
+aggr_plot <- aggr(df, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+                  labels=names(df), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+
+```{r}
+gg_miss_upset(df)
+# gg_miss_span(High_Level_Indices,Electoral,span_every = 1000)
+```
+```{r}
+n_var_miss(df)
+```
+```{r}
+gg_miss_upset(df, nsets = n_var_miss(df))
+```
+```{r}
+gg_miss_upset(df,
+              nsets = 10,
+              nintersects = NA)
+
+
+```
+
+```{r}
+gg_miss_case(df)		     #Plot the number of missings per case (row)
+gg_miss_case_cumsum(df)	     #Plot of cumulative sum of missing for cases
+gg_miss_fct(df, Cancer)		     #Plot the number of missings for each variable, broken down by a factor
+gg_miss_var(df,show_pct = TRUE)   #Plot the number of missings for each variable
+gg_miss_var_cumsum(df)	 
+
+
+```
+```{r}
+ggplot(df,
+        aes(x = Size,
+        y = Age)) +
+        geom_miss_point() +
+        facet_wrap(~Treatment_grps)
+
+ggplot(df,
+        aes(x = Size,
+        y = Age)) +
+        geom_miss_point() +
+        facet_wrap(~Cancer)
+
+ggplot(df,
+        aes(x = Size,
+        y = Age)) +
+        geom_miss_point() +
+        facet_wrap(~Year)
+
+ggplot(df,
+        aes(x = Size,
+        y = Age)) +
+        geom_miss_point() +
+        facet_wrap(~HCC_BCLC_Stage)
+
+ggplot(df,
+        aes(x = Size,
+        y = Survival_fromMDM)) +
+        geom_miss_point() +
+        facet_wrap(~Alive_Dead)
+```
+
+
+```{r}
+ggplot(df, aes(fill=Alive_Dead, y=Survival_fromMDM, x=Treatment_grps)) +
+  geom_bar(position='dodge', stat='identity') +
+  ggtitle('Survival from Multidisciplinary Meeting by Treatment Groups') +
+  xlab('Treatment_groups') +
+  ylab('Survival_fromMDM (in Months)') +
+  scale_fill_manual('Event', values=c('coral2','blue'))
+```
+
+#Drop Columns
+```{r}
+#We drop columns with more than 32% missing values 
+sapply(df, function(x) sum(is.na(x)))
+columns_to_drop <- c("Bleed","ICC_TNM_Stage" , 
+                     "Type_of_incidental_finding","Surveillance_effectiveness",
+                     "Mode_of_surveillance_detection","Time_diagnosis_1st_Tx" ,
+                     "Date_incident_surveillance_scan","Time_MDM_1st_treatment",
+                     "Time_decisiontotreat_1st_treatment","Months_from_last_surveillance")
+
+column_indices_to_drop <- which(names(df) %in% columns_to_drop)
+df <- df[, -column_indices_to_drop]
+head(df)
+```
+```{r}
+dim(df)
+```
+
+# Imputation:
+
+
+```{r}
+Testing <-  df[complete.cases(df), ]
+Training <- prodNA(Testing, noNA = 0.3)
+dim(Training)
+```
+
+
+```{r}
+# Run mice with different methods
+imp1 <- mice(Training, method = "pmm", m = 5, maxit = 10, seed = 500) 
+summary(imp1)
+```
+
+
+```{r}
+xyplot(imp2, Size ~ Survival_fromMDM + Age, pch=18, cex=1)
+```
+```{r}
+imp2 <- mice(Training, method = "rf", m = 5, maxit = 10, seed = 500)
+summary(imp2)
+```
+
+
+```{r}
+missforest_data_df <- missForest(Training, verbose = TRUE)
+missforest_data_df <- as.data.frame(missforest_data_df$ximp)
+
+```
+
+
+```{r}
+rf_data <- complete(imp2,3)
+pmm_data <- complete(imp1, 3)
+rf_data <- as.data.frame(rf_data)
+pmm_data <- as.data.frame(pmm_data)
+
+```
+
+
+```{r}
+# Create a data frame to store results
+results <- data.frame(Method = character(0), RMSE = numeric(0), MAE = numeric(0))
+
+# Define a function to calculate RMSE and MAE
+calculate_metrics <- function(predictions, actual) {
+  rmse <- sqrt(mean((predictions - actual)^2))
+  mae <- mean(abs(predictions - actual))
+  return(c(RMSE = round(rmse, 2), MAE = round(mae, 2)))
+}
+
+
+# MissForest approach
+method <- "MissForest"
+# Define X and y for MissForest approach
+X_missforest <- as.matrix(model.matrix(~ . - 1, data = missforest_data_df))
+y <- as.vector(missforest_data_df$Size)
+# Run cross-validated glmnet with optimal lambda
+cv_fit_missforest <- cv.glmnet(X_missforest, y)
+# Get the lambda value that minimizes the mean cross-validated error
+optimal_lambda_missforest <- cv_fit_missforest$lambda.min
+# Fit glmnet with the optimal lambda value
+fit_optimal_lambda_missforest <- glmnet(X_missforest, y, alpha = 0.5, lambda = optimal_lambda_missforest)
+# Predict on the training set
+predictions_missforest <- predict(fit_optimal_lambda_missforest, newx = X_missforest)
+# Calculate RMSE and MAE
+metrics_missforest <- calculate_metrics(predictions_missforest, y)
+results <- rbind(results, c(method, metrics_missforest))
+
+# PMM approach 
+method <- "Predictive Mean Matching"
+
+X_pmm <- as.matrix(model.matrix(~ . - 1, data = pmm_data))
+y <- as.vector(pmm_data$Size)
+# Run cross-validated glmnet with optimal lambda
+cv_fit_pmm <- cv.glmnet(X_pmm, y)
+# Get the lambda value that minimizes the mean cross-validated error
+optimal_lambda_pmm <- cv_fit_pmm$lambda.min
+# Fit glmnet with the optimal lambda value
+fit_optimal_lambda_pmm <- glmnet(X_pmm, y, alpha = 0.5, lambda = optimal_lambda_pmm)
+# Predict on the training set
+predictions_pmm <- predict(fit_optimal_lambda_pmm, newx = X_pmm)
+# Calculate RMSE and MAE
+metrics_pmm <- calculate_metrics(predictions_pmm, y)
+results <- rbind(results, c(method, metrics_pmm))
+
+# Random Forest imputation approach 
+
+method <- "Random Forest Imputation"
+# Define X and y for Random Forest imputation approach
+X_rf <- as.matrix(model.matrix(~ . - 1, data = rf_data))
+y <- as.vector(rf_data$Size)
+# Run cross-validated glmnet with optimal lambda
+cv_fit_rf <- cv.glmnet(X_rf, y)
+# Get the lambda value that minimizes the mean cross-validated error
+optimal_lambda_rf <- cv_fit_rf$lambda.min
+# Fit glmnet with the optimal lambda value
+fit_optimal_lambda_rf <- glmnet(X_rf, y, alpha = 0.5, lambda = optimal_lambda_rf)
+# Predict on the training set
+predictions_rf <- predict(fit_optimal_lambda_rf, newx = X_rf)
+# Calculate RMSE and MAE
+metrics_rf <- calculate_metrics(predictions_rf, y)
+results <- rbind(results, c(method, metrics_rf))
+
+
+colnames(results) <- c("Method", "RMSE", "MAE")
+
+# Print or display the results
+print(results)
+
+
+
+```
+
+```{r}
+densityplot(imp1)
+densityplot(imp2)
+
+
+
+```
+
+```{r}
+
+#Impute the entire dataset
+impute_data <- missForest(df, verbose = TRUE)
+df <- as.data.frame(impute_data$ximp)
+```
+
+#  1). check whether cancer effected people are more in Pandemic compare to Prepandemic
+
+Ho(null-hypothesis): cancer effected during pandemic = cancer effected during prepandemic
+
+Ha(alternative-hypothesis): cancer effected during pandemic != cancer effected during prepandemic
+
+```{r}
+contingency_table <- table(df$Year, df$Cancer)
+print(contingency_table)
+```
+```{r}
+proportions <- prop.table(contingency_table, margin = 1)
+print(contingency_table)
+# Step 3: Conduct a two-sample proportion test
+test_result <- prop.test(c(120, 190), c(120 + 64, 190 + 76), correct = FALSE)
+print(test_result)
+
+# Step 4: Visualize the contingency table using a bar plot
+barplot(as.matrix(contingency_table), beside = TRUE, legend.text = FALSE, col = c("blue", "orange"), main = "Cancer Cases by Year", xlab = "Year", ylab = "Frequency")
+legend("topleft",    # Position of the legend
+       legend = c("Pandemic", "Prepandemic"),   # Legend labels
+       fill = c("blue", "orange"))  
+
+```
+
+#does cancer effects gender?
+
+Ho(null-hypothesis): male having cancer = female having cancer
+
+Ha(alternative-hypothesis) male having cancer != female having cancer
+```{r}
+
+# Step 1: Create the contingency table
+contingency_table <- table(df$Gender, df$Cancer)
+print(contingency_table)
+
+# Step 2: Calculate proportions
+proportions <- prop.table(contingency_table, margin = 1)
+
+# Step 3: Conduct a two-sample proportion test
+# Perform proportion test
+test_result <- prop.test(c(62, 244), c(52 + 62, 87 + 244), correct = FALSE)
+print(test_result)
+
+# Step 4: Visualize the contingency table using a bar plot
+barplot(as.matrix(contingency_table), beside = TRUE, legend.text = FALSE, col = c("blue", "orange"), main = "Cancer Cases by Gender", xlab = "Cancer", ylab = "Frequency")
+
+# Add legend
+legend("topleft",    # Position of the legend
+       legend = c("Female", "Male"),   # Legend labels
+       fill = c("blue", "orange"))
+
+# Add title for legend
+title(legend = "Cancer")
+
+ 
+```
+```{r}
+# Step 1: Create the contingency table
+contingency_table <- table(df$Gender, df$Year)
+print(contingency_table)
+```
+
+
+```{r}
+# Filter the data to include only observations during the pandemic period
+pandemic_data <- subset(df, Year == "Pandemic")
+dim(pandemic_data)
+# Create a contingency table of gender and cancer flag for the pandemic period
+contingency_table <- table(pandemic_data$Gender, pandemic_data$Cancer)
+print(contingency_table)
+
+# Perform a two-sample proportion test
+test_result <- prop.test(c(contingency_table[1, 2], contingency_table[2, 2]), 
+                          c(rowSums(contingency_table)), correct = FALSE)
+print(test_result)
+
+
+```
+```{r}
+barplot(as.matrix(contingency_table), beside = TRUE, legend.text = FALSE, col = c("blue", "orange"), main = "Cancer Cases by Gender during Pandemic", xlab = "Cancer", ylab = "Frequency")
+
+# Add legend
+legend("topleft",    # Position of the legend
+       legend = c("Female", "Male"),   # Legend labels
+       fill = c("blue", "orange"))
+
+
+
+```
+
+
+```{r}
+t_test <- t.test(Size ~ Year, data = df)
+print(t_test)
+```
+```{r}
+# Create a contingency table of BCLC stages by year
+contingency_table <- table(df$HCC_BCLC_Stage, df$Year)
+
+# Display the contingency table
+print(contingency_table)
+
+# Perform a chi-square test of independence
+# Perform Fisher's exact test
+fisher_test <- fisher.test(contingency_table)
+print(fisher_test)
+
+
+```
+
+```{r}
+ggplot(df, aes(x = Year, y = Size, fill = Year)) +
+  geom_boxplot() +
+  labs(title = "Comparison of Tumor Size by Pandemic Period",
+       x = "Year",
+       y = "Tumor Size") +
+  scale_fill_manual(values = c("Prepandemic" = "blue", "Pandemic" = "orange")) +  # Set colors for pandemic periods
+  theme_minimal()
+```
+
+```{r}
+table_presentation <- table(df$Mode_Presentation, df$Year)
+# Perform chi-squared test
+chisq_test <- chisq.test(table_presentation)
+print(chisq_test)
+
+ggplot(df, aes(x = Mode_Presentation, fill = Year)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(title = "Mode of Presentation by Year",
+       x = "Mode of Presentation",
+       y = "Count") +
+  scale_fill_manual(values = c("Prepandemic" = "blue", "Pandemic" = "orange")) +  # Set colors for each year
+  theme_minimal()
+```
+
+```{r}
+#Convert to Numerical values
+df1<- df
+df1$Cancer<- as.numeric(factor(df1$Cancer))
+df1$Cirrhosis <- as.numeric(factor(df1$Cirrhosis))
+df1$Surveillance_programme<- as.numeric(factor(df1$Surveillance_programme))
+df1$HCC_TNM_Stage<- as.numeric(factor(df1$HCC_TNM_Stage))
+df1$Etiology<- as.numeric(factor(df1$Etiology))
+df1$Year<-as.numeric(factor(df1$Year))
+df1$Mode_Presentation<-as.numeric(factor(df1$Mode_Presentation))
+df1$Gender<-as.numeric(factor(df1$Gender))
+df1$HCC_BCLC_Stage<-as.numeric(factor(df1$HCC_BCLC_Stage))
+df1$Treatment_grps<-as.numeric(factor(df1$Treatment_grps))
+df1$Alive_Dead<-as.numeric(factor(df1$Alive_Dead))
+df1$Prev_known_cirrhosis<-as.numeric(factor(df1$Prev_known_cirrhosis))
+```
+
+
+```{r}
+pie_data <- df %>%
+  group_by(Year, Alive_Dead) %>%
+  summarise(count = n()) %>%
+  mutate(percent = count / sum(count) * 100)
+# Define custom colors
+custom_colors <- c("Dead" = "coral", "Alive" = "blue")
+
+# Plot pie charts
+pie_charts <- list()
+for (year in unique(df$Year)) {
+  plot_data <- pie_data %>%
+    filter(Year == year)
+  
+  pie_charts[[year]] <- ggplot(plot_data, aes(x = "", y = percent, fill = Alive_Dead)) +
+    geom_bar(stat = "identity") +
+    coord_polar("y", start = 0) +
+    labs(title = paste("", year)) +
+    scale_fill_discrete(labels = c("Dead", "Alive")) + scale_fill_manual(values = custom_colors) +  # Set custom colors # Customize the legend labels
+    theme_void() +
+    theme(legend.position = "bottom")
+}
+
+# Arrange the pie charts
+gridExtra::grid.arrange(grobs = pie_charts, ncol = 2)
+
+```
+```{r}
+ggplot(data = df1, aes(x = Age, y = Size, color = Cancer)) +
+  geom_point() +
+  labs(title = "Relationship between Age and Size by Cancer Status",
+       x = "Age", y = "Size") +
+  theme_minimal()
+
+boxplot(df1, col = "blue")
+
+
+#Correlation Analysis
+
+cor_matrix<-cor(df1)
+corrplot(cor_matrix,tl.pos ='lt',tl.col="black", tl.cex=0.55,method='circle')
+```
+
+```{r}
+ggplot(df, aes(x = Year, fill = Year)) +
+  geom_bar(color = "black", width = 0.6) +  # Adjust the width as needed (default is 0.9)
+  labs(title = "Count of Liver Cancer Cases by Year",
+       x = "Year",
+       y = "Count") + 
+  scale_fill_manual(values = c("Prepandemic" = "blue", "Pandemic" = "orange")) +  # Set colors for each year
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(df, aes(x = Gender, fill = Year)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(title = "Gender Distribution by Pandemic Period",
+       x = "Gender",
+       y = "Count") +
+  scale_fill_manual(values = c("Prepandemic" = "blue", "Pandemic" = "orange")) +  # Set colors for pandemic periods
+  theme_minimal()
+
+```
+## Survival Analysis
+```{r}
+df$Alive_Dead<-as.numeric(factor(df$Alive_Dead))
+
+# Create the survival fit object
+fit.surv <- survfit(Surv(df$Survival_fromMDM, df$Alive_Dead) ~ 1)
+ggsurvplot(fit.surv, data = df, xlab = "Months", ylab = "Estimated Probability of Survival", title = 'Kaplan Meir Survival Curve', ggtheme = theme_minimal()) 
+
+```
+
+
+```{r}
+fit.sex <- survfit(Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Gender)
+
+
+ggsurvplot(fit.sex, data = df, conf.int = TRUE, pval = FALSE, risk.table = FALSE, xlab = "Months", ylab = "Estimated Probability of Survival", title = 'Survival Curve by Gender', legend.labs = c("Female", "Male"), legend = "right", break.time.by = 10, legend.title = "Year", censor.shape = "|", censor.size = 3, palette = c("firebrick", "goldenrod1"), ggtheme = theme_minimal())
+
+logrank.test <- survdiff (Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Gender)
+logrank.test
+```
+
+
+```{r}
+fit.year <- survfit(Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Year)
+ggsurvplot(fit.year, data = df, conf.int = TRUE, pval = FALSE, risk.table = FALSE, xlab = "Months", ylab = "Estimated Probability of Survival", title = 'Survival Curve by Year', legend.labs = c("pandemic", "pre-pandemic"), legend = "right", break.time.by = 10, legend.title = "Year", censor.shape = "|", censor.size = 3, palette = c("firebrick", "goldenrod1"), ggtheme = theme_minimal())
+
+
+logrank.test <- survdiff (Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Year)
+logrank.test
+
+```
+
+
+```{r}
+fit.hcc <- survfit(Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$HCC_BCLC_Stage)
+
+ggsurvplot(fit.hcc, data = df, conf.int = TRUE, pval = FALSE, risk.table = FALSE, legend.labs=c("0", "A", "B", "C", "D" ),legend = "right", break.time.by = 10, legend.title = "HCC_BCLC_Stage", censor.shape = "|", censor.size = 3, palette=c( "red", "goldenrod1", "skyblue","blue","firebrick" ), xlab = "Months", ylab = "Estimated Probability of Survival",  ggtheme = theme_minimal())
+
+
+logrank.test <- survdiff (Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$HCC_BCLC_Stage)
+logrank.test
+```
+
+
+```{r}
+# Fit survival curves by Mode_Presentation
+fit.mode <- survfit(Surv(df$Survival_fromMDM, df$Alive_Dead) ~ df$Mode_Presentation)
+
+# Create ggsurvplot with similar settings
+ggsurvplot(
+  fit.mode,
+  data = df,
+  conf.int = TRUE,
+  pval = FALSE,
+  risk.table = FALSE,
+  legend.labs = levels(df$Mode_Presentation),
+  legend = "right",
+  legend.title = "Mode Presentation",
+  palette = c("skyblue", "goldenrod1", "firebrick"),
+  xlab = "Months",
+  ylab = "Estimated Probability of Survival",
+  ggtheme = theme_minimal()
+)
+
+
+logrank.test <- survdiff (Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Mode_Presentation)
+logrank.test
+```
+```{r}
+km_cancer <- survfit(Surv(df$Survival_fromMDM, df$Alive_Dead) ~ df$Cancer, data = df)
+ggsurvplot(km_cancer, data = df, conf.int = TRUE, pval = FALSE, risk.table = FALSE, xlab = "Months", ylab = "Estimated Probability of Survival", title = 'Survival Curve by Year', legend = "right", break.time.by = 10, legend.title = "Cancer Status", censor.shape = "|", censor.size = 3, palette = c("firebrick", "goldenrod1"), ggtheme = theme_minimal())
+
+
+
+logrank.test <- survdiff (Surv(df$Survival_fromMDM , df$Alive_Dead) ~ df$Cancer)
+logrank.test
+```
+```{r}
+summary(df)
+```
+
+
+```{r}
+attach(df)
+# Fit the Cox proportional hazards model
+cox_model <- coxph(Surv(Survival_fromMDM, Alive_Dead) ~ Month + Year + Age + Size + PS + Cancer + Cirrhosis + Mode_Presentation + Gender + HCC_BCLC_Stage  + HCC_TNM_Stage + Treatment_grps + Prev_known_cirrhosis + Surveillance_programme, data = df)
+summary(cox_model)
+
+# Get the survival probabilities from the fitted model
+survival_curve <- survfit(cox_model)
+
+```
+```{r}
+cox_zph <- cox.zph(cox_model)
+
+# Plot Schoenfeld residuals against time for each covariate
+plot(cox_zph)
+```
+
+```{r}
+df <- df[df$Survival_fromMDM > 0, ]
+
+surv_obj = Surv(df$Survival_fromMDM, df$Alive_Dead)
+X <- model.matrix(~ . - Survival_fromMDM - Alive_Dead, data = df)
+
+
+
+show_fit=glmnet(X,surv_obj,standardize=TRUE,lambda=seq(0,1,.01),family = "cox")
+plot(show_fit,label=TRUE)
+plot(show_fit,xvar = "lambda",label=TRUE)
+
+surv_model = cv.glmnet(X,surv_obj, family = "cox", type.measure = "deviance",
+alpha=1, nfolds = 5)
+plot(surv_model)
+print(surv_model)
+```
+```{r}
+df_fit <- df[, !(names(df) %in% c("Survival_FDM", "Alive_Dead"))]
+
+lambda_opt = surv_model$lambda.min
+fit = glmnet(df_fit, surv_obj, family = "cox", lambda = lambda_opt)
+```
+
+
+```{r}
+
+# Define survival object
+surv_obj <- Surv(df$Survival_fromMDM, df$Alive_Dead)
+
+# Remove 'Survival_fromMDM' and 'Alive_Dead' columns from the data frame
+df_fit <- df[, !(names(df) %in% c("Survival_fromMDM", "Alive_Dead"))]
+
+# Create model matrix
+X <- model.matrix(~ . - 1, data = df_fit)
+
+# Fit Cox model using glmnet
+show_fit <- glmnet(X, surv_obj, standardize = TRUE, lambda = seq(0, 1, 0.01), family = "cox")
+
+# Plot the coefficients
+plot(show_fit, label = TRUE)
+
+# Plot lambda path
+plot(show_fit, xvar = "lambda", label = TRUE)
+
+# Cross-validate glmnet model
+surv_model <- cv.glmnet(X, surv_obj, family = "cox", type.measure = "C", alpha = 1, nfolds = 5)
+
+# Plot cross-validation results
+plot(surv_model)
+
+# Print cross-validation results
+print(surv_model)
+
+# Find optimal lambda
+lambda_opt <- surv_model$lambda.min
+
+# Fit final model using optimal lambda
+fit <- glmnet(X, surv_obj, family = "cox", lambda = lambda_opt)
+
+# Make predictions
+predictions <- predict(fit, newx = X, type = "response")
+
+# Calculate concordance index
+c_index <- Cindex(predictions, surv_obj)
+print(c_index)
+```
+
